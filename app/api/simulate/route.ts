@@ -66,7 +66,8 @@ export async function GET(request: Request) {
       const savedMessages = await db.select().from(messages).where(eq(messages.experimentId, runId));
       const savedProfiles = await db.select().from(profiles).where(eq(profiles.experimentId, runId));
       const savedMatches = await db.select().from(matches).where(eq(matches.experimentId, runId));
-      return Response.json({ configured, run: run[0] || null, messages: savedMessages, profiles: savedProfiles, matches: savedMatches });
+      const savedOutcomes = await db.select().from(outcomes).where(eq(outcomes.experimentId, runId));
+      return Response.json({ configured, run: run[0] || null, messages: savedMessages, profiles: savedProfiles, matches: savedMatches, outcomes: savedOutcomes });
     }
     const runs = await db.select().from(experiments).orderBy(desc(experiments.createdAt)).limit(12);
     return Response.json({ configured, models: [...MODELS], runs });
@@ -83,7 +84,7 @@ export async function POST(request: Request) {
     const db = getDb();
     if (action === "create_run") {
       const runId = id("run"), now = new Date();
-      await db.insert(experiments).values({ id: runId, createdAt: now, status: "running", population: Math.min(100, Math.max(2, Number(body.population || 20))), rounds: Math.min(10, Math.max(1, Number(body.rounds || 4))), concurrency: Math.min(8, Math.max(1, Number(body.concurrency || 3))), modelA: safeModel(body.modelA), modelB: safeModel(body.modelB), promptA: String(body.promptA || "guardian-v1"), promptB: String(body.promptB || "guardian-v2"), configJson: JSON.stringify(body.config || {}) });
+      await db.insert(experiments).values({ id: runId, createdAt: now, status: "running", population: Math.min(300, Math.max(2, Number(body.population || 20))), rounds: Math.min(10, Math.max(1, Number(body.rounds || 4))), concurrency: Math.min(8, Math.max(1, Number(body.concurrency || 3))), modelA: safeModel(body.modelA), modelB: safeModel(body.modelB), promptA: String(body.promptA || "guardian-v1"), promptB: String(body.promptB || "guardian-v2"), configJson: JSON.stringify(body.config || {}) });
       return Response.json({ runId }, { status: 201 });
     }
     if (action === "turn") {
