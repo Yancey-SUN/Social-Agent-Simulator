@@ -24,16 +24,17 @@ function safeModel(value: unknown) { const model = String(value || "deepseek-v4-
 function transcript(history: HistoryItem[]) { return history.map((m, i) => `${i + 1}. ${m.speaker === "user" ? "用户" : "守护灵"}：${m.content}`).join("\n"); }
 function runtimeEnv() { return env as unknown as { DEEPSEEK_API_KEY?: string; DEEPSEEK_BASE_URL?: string } }
 
-async function callDeepSeek(args: { model: string; system: string; user: string; json?: boolean; maxTokens?: number }) {
+async function callDeepSeek(args: { model: string; system: string; user: string; json?: boolean; maxTokens?: number; apiKey?: string }) {
   const runtime = runtimeEnv();
-  if (!runtime.DEEPSEEK_API_KEY) throw new Error("DEEPSEEK_API_KEY_NOT_CONFIGURED");
+  const apiKey = args.apiKey || runtime.DEEPSEEK_API_KEY;
+  if (!apiKey) throw new Error("DEEPSEEK_API_KEY_NOT_CONFIGURED");
   const model = safeModel(args.model);
   const started = Date.now();
   let lastError = "DeepSeek returned empty content";
   for (let attempt = 0; attempt < (args.json ? 2 : 1); attempt++) {
     const response = await fetch(`${(runtime.DEEPSEEK_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${runtime.DEEPSEEK_API_KEY}` },
+      headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({ model, messages: [{ role: "system", content: args.system }, { role: "user", content: args.user }], stream: false, max_tokens: args.maxTokens || 500, ...(args.json ? { response_format: { type: "json_object" } } : {}) }),
     });
     const body = await response.json() as { error?: { message?: string }; choices?: Array<{ message?: { content?: string } }>; usage?: DeepSeekUsage };
@@ -56,7 +57,7 @@ async function addUsage(experimentId: string, model: string, usage: DeepSeekUsag
 }
 
 export async function GET(request: Request) {
-  const configured = Boolean(runtimeEnv().DEEPSEEK_API_KEY);
+  const configured = Boolean(request.headers.get("x-deepseek-api-key") || runtimeEnv().DEEPSEEK_API_KEY);
   const runId = new URL(request.url).searchParams.get("run_id");
   try {
     const db = getDb();
@@ -77,6 +78,7 @@ export async function GET(request: Request) {
 export async function POST(request: Request) {
   try {
     const body = await request.json() as Record<string, any>;
+    const sessionApiKey = request.headers.get("x-deepseek-api-key") || undefined;
     const action = String(body.action || "");
     const db = getDb();
     if (action === "create_run") {
@@ -91,7 +93,7 @@ export async function POST(request: Request) {
         ? `你不是助手，你是在产品测试里被模拟的真实用户“${persona.name}”。你${persona.age || 29}岁，在${persona.city || "一座城市"}做${persona.job || "自己的工作"}。你目前${persona.stage || "处于生活变化期"}。人格底色：${persona.archetype || "复杂、慢热"}。命理冷启动意象：${persona.baziPrior || "无"}，它只是民俗叙事先验，不代表你必须相信或主动谈命理。\n你要像真实用户一样逐渐建立信任：会简短、跑题、犹豫、纠正自己、吐槽、沉默，也会问工作、关系、家庭、身体感受、钱、创作、迁移、孤独、兴趣和琐事。不要每轮都提问，不要解释人设，不说“作为AI”或“测试”。结合已有对话，只输出下一条自然用户消息。`
         : (guardianPrompts[String(body.promptVersion)] || guardianPrompts["guardian-v1"]);
       const user = role === "user" ? `当前场景：${persona.scenario || "一次普通闲聊"}\n潜在关注：${persona.topic || "最近的生活"}、${persona.secondary || "关系"}\n已有对话：\n${transcript(history) || "（这是第一句话，请从一个具体生活细节自然开始）"}` : `用户画像先验：${persona.name}，${persona.stage || "生活变化期"}，可能关注${persona.topic || "最近的生活"}。\n已有对话：\n${transcript(history)}\n请回复用户最后一句。`;
-      const result = await callDeepSeek({ model, system, user, maxTokens: 260 });
+      const result = await callDeepSeek({ model, system, user, maxTokens: 260, apiKey: sessionApiKey });
       const usage = await addUsage(String(body.experimentId), result.model, result.usage);
       await db.insert(messages).values({ id: id("msg"), experimentId: String(body.experimentId), personaId: String(persona.id), variant, turnIndex: Number(body.turnIndex || 0), speaker: role, content: result.content, model: result.model, promptVersion: String(body.promptVersion || "user-v1"), inputTokens: usage.input, outputTokens: usage.output, latencyMs: result.latencyMs, createdAt: new Date() });
       return Response.json({ text: result.content, usage: { ...usage, latencyMs: result.latencyMs }, model: result.model });
@@ -99,7 +101,7 @@ export async function POST(request: Request) {
     if (action === "profile") {
       const persona = body.persona as PersonaSeed, history = (body.history || []) as HistoryItem[], model = safeModel(body.model), variant = body.variant === "B" ? "B" : "A";
       const system = `你是 Memory Session Compactor 与 Profile Curator。只根据对话证据输出 json，不做命理推断，不把一次性情绪写成稳定人格。Unknown 不等于 Yes。每项保留 evidence、confidence、recency、permission。JSON 示例：{"episode_summary":"","stable_profile":[{"claim":"","evidence":"","confidence":0.0}],"active_state":[{"claim":"","evidence":"","expires_days":7}],"social_intent":{"state":"explicit|implicit|unknown|negative","topic":"","strength":0.0,"evidence":""},"social_preference":{"relationship":"ahead|peer|contrast|complement|unknown","evidence":""},"no_go":[],"open_questions":[],"readiness":0.0}`;
-      const result = await callDeepSeek({ model, system, user: `用户：${persona.name}\n对话：\n${transcript(history)}\n输出完整 json。`, json: true, maxTokens: 1200 });
+      const result = await callDeepSeek({ model, system, user: `用户：${persona.name}\n对话：\n${transcript(history)}\n输出完整 json。`, json: true, maxTokens: 1200, apiKey: sessionApiKey });
       const profile = JSON.parse(result.content); const usage = await addUsage(String(body.experimentId), result.model, result.usage);
       await db.insert(profiles).values({ id: id("profile"), experimentId: String(body.experimentId), personaId: String(persona.id), variant, profileJson: JSON.stringify(profile), readiness: Math.max(0, Math.min(1, Number(profile.readiness || 0))), evidenceJson: JSON.stringify([...(profile.stable_profile || []), ...(profile.active_state || [])]), createdAt: new Date() });
       return Response.json({ profile, usage: { ...usage, latencyMs: result.latencyMs } });
@@ -107,7 +109,7 @@ export async function POST(request: Request) {
     if (action === "match") {
       const model = safeModel(body.model), variant = body.variant === "B" ? "B" : "A";
       const system = `你是 Relationship Researcher。评估的单位是 Social Opportunity，不做整段聊天相似度。综合 active state、intent、topic、stage、preference、no_go、mutual value 与适度 surprise。只输出 json。JSON 示例：{"score":0.0,"relationship_type":"peer|ahead|contrast|complement|unexpected","resonance":"","mutual_value":"","risk":"","evidence":[""],"recommend":true}`;
-      const result = await callDeepSeek({ model, system, user: `候选A：${JSON.stringify(body.profileA)}\n候选B：${JSON.stringify(body.profileB)}\n输出关系研究 json。`, json: true, maxTokens: 800 });
+      const result = await callDeepSeek({ model, system, user: `候选A：${JSON.stringify(body.profileA)}\n候选B：${JSON.stringify(body.profileB)}\n输出关系研究 json。`, json: true, maxTokens: 800, apiKey: sessionApiKey });
       const research = JSON.parse(result.content), matchId = id("match"), usage = await addUsage(String(body.experimentId), result.model, result.usage);
       await db.insert(matches).values({ id: matchId, experimentId: String(body.experimentId), personaAId: String(body.personaAId), personaBId: String(body.personaBId), variant, score: Math.max(0, Math.min(1, Number(research.score || 0))), relationType: String(research.relationship_type || "unexpected"), researchJson: JSON.stringify(research), status: research.recommend ? "opportunity" : "filtered", createdAt: new Date() });
       return Response.json({ matchId, research, usage: { ...usage, latencyMs: result.latencyMs } });
