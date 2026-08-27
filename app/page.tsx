@@ -30,6 +30,7 @@ function hash(text: string) { let h = 2166136261; for (let i=0;i<text.length;i++
 function rng(seed: string) { let s = hash(seed) || 1; return () => ((s = Math.imul(1664525, s) + 1013904223 >>> 0) / 4294967296); }
 function clamp(n:number,min=0,max=1){return Math.min(max,Math.max(min,n))}
 function pct(n:number){return `${Math.round(n*100)}%`}
+function normalizeApiKey(value:string){return value.trim().replace(/^Bearer\s+/i,"").replace(/\s+/g,"")}
 async function runPool<T>(items:T[],limit:number,worker:(item:T)=>Promise<void>,onError?:(item:T,error:unknown)=>void){let cursor=0;await Promise.all(Array.from({length:Math.min(limit,items.length)},async()=>{while(cursor<items.length){const item=items[cursor++];try{await worker(item)}catch(error){onError?.(item,error)}}}))}
 
 function savedRunConfig(run:SharedRun){try{return JSON.parse(run.configJson||"{}")}catch{return {}}}
@@ -116,7 +117,7 @@ export default function Home(){
   const [historyLoading,setHistoryLoading]=useState(false);
   const [sharedView,setSharedView]=useState(false);
   const [runFailures,setRunFailures]=useState<RunFailure[]>([]);
-  const hasProvider=Boolean(providerReady||sessionKey.trim().length>10);
+  const hasProvider=Boolean(providerReady||normalizeApiKey(sessionKey).length>10);
   const ready=data.users.filter(u=>u.readiness>=config.threshold).length;
   const gated=data.users.filter(u=>u.readiness>=config.threshold&&(u.intent==="explicit"||u.intent==="implicit")&&u.discoverable).length;
   const groups=data.matches.filter(m=>m.status==="group").length;
@@ -130,7 +131,7 @@ export default function Home(){
   const update=<K extends keyof Config>(k:K,v:Config[K])=>setConfig(c=>({...c,[k]:v}));
   const exportRun=()=>{const blob=new Blob([JSON.stringify({config,summary:{ready,gated,matches:data.matches.length,groups},...data},null,2)],{type:"application/json"});const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=`vouch-sim-${config.seed}.json`;a.click();URL.revokeObjectURL(a.href)};
   const importPersonas=async(e:React.ChangeEvent<HTMLInputElement>)=>{const f=e.target.files?.[0];if(!f)return;const text=await f.text();let names:string[]=[];try{const x=JSON.parse(text);if(Array.isArray(x))names=x.map((v:any)=>typeof v==="string"?v:String(v.name||v.id||"")).filter(Boolean)}catch{names=text.split(/\r?\n/).slice(1).map(x=>x.split(",")[0].trim()).filter(Boolean)}if(names.length){const size=Math.min(300,Math.max(20,names.length));setCustomNames(names);setUniverseSize(size);setData(buildSimulation({...config,population:size},names));update("population",Math.min(config.population,size));}}
-  const api=async(payload:Record<string,unknown>,signal?:AbortSignal)=>{const headers:Record<string,string>={"Content-Type":"application/json"};if(sessionKey.trim())headers["X-DeepSeek-API-Key"]=sessionKey.trim();let res:Response;try{res=await fetch("/api/simulate",{method:"POST",headers,body:JSON.stringify(payload),signal})}catch(error){if(error instanceof DOMException&&error.name==="AbortError")throw error;throw new Error("无法连接实验服务，请刷新页面后重试；如果仍失败，请检查网络和 DeepSeek Key")};let out:any;try{out=await res.json()}catch{throw new Error(`实验服务返回异常（HTTP ${res.status}）`)}if(!res.ok)throw new Error(out.error||`实验服务错误（HTTP ${res.status}）`);return out};
+  const api=async(payload:Record<string,unknown>,signal?:AbortSignal)=>{const headers:Record<string,string>={"Content-Type":"application/json"};const cleanKey=normalizeApiKey(sessionKey);if(cleanKey)headers["X-DeepSeek-API-Key"]=cleanKey;let res:Response;try{res=await fetch("/api/simulate",{method:"POST",headers,body:JSON.stringify(payload),signal})}catch(error){if(error instanceof DOMException&&error.name==="AbortError")throw error;throw new Error("请求尚未到达实验服务器。请重新粘贴 DeepSeek Key（系统会自动清除空格、换行和 Bearer 前缀），或刷新页面后重试")};let out:any;try{out=await res.json()}catch{throw new Error(`实验服务返回异常（HTTP ${res.status}）`)}if(!res.ok)throw new Error(out.error||`实验服务错误（HTTP ${res.status}）`);return out};
   async function loadSharedRun(runId:string,goToOverview=false){
     setHistoryLoading(true);setRunError("");
     try{
