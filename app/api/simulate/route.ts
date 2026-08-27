@@ -2,9 +2,10 @@ import { env } from "cloudflare:workers";
 import { desc, eq, sql } from "drizzle-orm";
 import { getDb } from "../../../db";
 import { experiments, matches, messages, outcomes, profiles } from "../../../db/schema";
+import { buildUserSimulationPrompt, NATURAL_GUARDIAN_PROMPT } from "./prompts";
 
 type HistoryItem = { speaker: "user" | "agent"; content: string };
-type PersonaSeed = { id: number | string; name: string; age?: number; city?: string; job?: string; archetype?: string; topic?: string; secondary?: string; stage?: string; scenario?: string; baziPrior?: string };
+type PersonaSeed = { id: number | string; name: string; age?: number; city?: string; job?: string; archetype?: string; topic?: string; secondary?: string; stage?: string; scenario?: string; preference?: string; baziPrior?: string };
 type DeepSeekUsage = { prompt_tokens?: number; completion_tokens?: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number };
 
 const MODELS = new Set(["deepseek-v4-flash", "deepseek-v4-pro"]);
@@ -14,6 +15,7 @@ const PRICE: Record<string, { input: number; output: number }> = {
 };
 
 const guardianPrompts: Record<string, string> = {
+  "guardian-natural-v3": NATURAL_GUARDIAN_PROMPT,
   "guardian-v1": `你是用户熟悉的守护灵朋友，有判断但不抢着解决问题。像微信聊天：有时只接一句，有时讲一个具体联想，有时沉默在某个细节上。问题只是偶尔使用，不把每轮变成访谈。不做情绪复读，不把普通生活命理化，不声称命理是科学事实。`,
   "guardian-v2": `你是一个有独立生活、边界、偏好和轻微缺点的小精灵朋友。你会记得前文，也会走神、分享自己的虚拟日常、温和反驳、开一点不过火的玩笑或自然换话题。少做分析，不像客服、咨询师或采访者，不主动讲命理。`,
 };
@@ -22,6 +24,10 @@ function id(prefix: string) { return `${prefix}_${crypto.randomUUID()}`; }
 function jsonError(message: string, status = 400) { return Response.json({ error: message }, { status }); }
 function safeModel(value: unknown) { const model = String(value || "deepseek-v4-flash"); return MODELS.has(model) ? model : "deepseek-v4-flash"; }
 function transcript(history: HistoryItem[]) { return history.map((m, i) => `${i + 1}. ${m.speaker === "user" ? "用户" : "守护灵"}：${m.content}`).join("\n"); }
+function splitChatBubbles(content: string) {
+  const lines = content.replace(/```(?:text)?/gi, "").split(/\n+/).map(line => line.trim().replace(/^(?:[-*•]|\d+[.)])\s*/, "").replace(/^(?:用户|守护者|小精灵)[:：]\s*/, "")).filter(Boolean);
+  return (lines.length ? lines : [content.trim()]).slice(0, 3);
+}
 function runtimeEnv() { return env as unknown as { DEEPSEEK_API_KEY?: string; DEEPSEEK_BASE_URL?: string } }
 
 async function callDeepSeek(args: { model: string; system: string; user: string; json?: boolean; maxTokens?: number; apiKey?: string }) {
@@ -89,21 +95,21 @@ export async function POST(request: Request) {
     const db = getDb();
     if (action === "create_run") {
       const runId = id("run"), now = new Date();
-      await db.insert(experiments).values({ id: runId, createdAt: now, status: "running", population: Math.min(300, Math.max(2, Number(body.population || 20))), rounds: Math.min(10, Math.max(1, Number(body.rounds || 4))), concurrency: Math.min(8, Math.max(1, Number(body.concurrency || 3))), modelA: safeModel(body.modelA), modelB: safeModel(body.modelB), promptA: String(body.promptA || "guardian-v1"), promptB: String(body.promptB || "guardian-v2"), configJson: JSON.stringify(body.config || {}) });
+      await db.insert(experiments).values({ id: runId, createdAt: now, status: "running", population: Math.min(300, Math.max(2, Number(body.population || 20))), rounds: Math.min(20, Math.max(1, Number(body.rounds || 4))), concurrency: Math.min(8, Math.max(1, Number(body.concurrency || 3))), modelA: safeModel(body.modelA), modelB: safeModel(body.modelB), promptA: String(body.promptA || "guardian-natural-v3"), promptB: String(body.promptB || "guardian-natural-v3"), configJson: JSON.stringify(body.config || {}) });
       return Response.json({ runId }, { status: 201 });
     }
     if (action === "turn") {
       const persona = body.persona as PersonaSeed, history = (body.history || []) as HistoryItem[];
       const role = body.role === "user" ? "user" : "agent", model = safeModel(body.model), variant = body.variant === "B" ? "B" : "A";
-      const conversationFingerprint = `${persona.archetype || "慢热"}；最近${persona.stage || "在调整生活"}；职业视角是${persona.job || "自由职业"}；容易从${persona.topic || "日常细节"}联想到${persona.secondary || "另一件小事"}；说话节奏编号${String(persona.id).slice(-2)}`;
       const system = role === "user"
-        ? `你不是助手，而是正在和熟悉的小精灵聊天的真实用户“${persona.name}”。你${persona.age || 29}岁，在${persona.city || "一座城市"}做${persona.job || "自己的工作"}。人物指纹：${conversationFingerprint}。命理意象${persona.baziPrior || "无"}只用于冷启动气质，不要主动讲命理。\n像真人一样延续自己的记忆和立场：可以说琐事、跳话题、吐槽、纠正前一句、只回几个字、讲一个具体经历，或暂时不接对方的问题。不要为了匹配而说想认识人，不要使用“很少有人理解我”“想找能聊深的人”等抽象社交模板。不要每条都写括号动作或舞台说明，五条里最多一次。长度在 6–90 个汉字间自然变化；至少一半消息不提问。只输出这一条用户消息。`
-        : `${guardianPrompts[String(body.promptVersion)] || guardianPrompts["guardian-v1"]}\n当前用户指纹：${conversationFingerprint}。不要像咨询师，不要每轮追问；至少四成回复不带问号。可以回应后停住、分享一个很短的精灵日常、提出具体看法、温和反驳或自然换话题。避免“听起来……”“你是A还是B”“最卡住你的是什么”等模板句。回复 1–3 句，语气与前文不同，不复述用户原话。`;
-      const user = role === "user" ? `当前场景：${persona.scenario || "一次普通闲聊"}\n潜在关注：${persona.topic || "最近的生活"}、${persona.secondary || "关系"}\n已有对话：\n${transcript(history) || "（这是第一句话，请从一个具体生活细节自然开始）"}` : `用户画像先验：${persona.name}，${persona.stage || "生活变化期"}，可能关注${persona.topic || "最近的生活"}。\n已有对话：\n${transcript(history)}\n请回复用户最后一句。`;
-      const result = await callDeepSeek({ model, system, user, maxTokens: 180, apiKey: sessionApiKey });
+        ? buildUserSimulationPrompt(persona)
+        : (guardianPrompts[String(body.promptVersion)] || guardianPrompts["guardian-natural-v3"]);
+      const user = role === "user" ? `这是你和守护者目前的微信聊天记录：\n${transcript(history) || "（还没有聊天记录）"}\n\n现在轮到你发消息。可以发 1–3 个连续微信气泡，每个气泡单独一行。` : `这是你和用户目前的微信聊天记录：\n${transcript(history)}\n\n现在轮到你回复。可以发 1–3 个连续微信气泡，每个气泡单独一行。`;
+      const result = await callDeepSeek({ model, system, user, maxTokens: 80, apiKey: sessionApiKey });
       const usage = await addUsage(String(body.experimentId), result.model, result.usage);
-      await db.insert(messages).values({ id: id("msg"), experimentId: String(body.experimentId), personaId: String(persona.id), variant, turnIndex: Number(body.turnIndex || 0), speaker: role, content: result.content, model: result.model, promptVersion: String(body.promptVersion || "user-v1"), inputTokens: usage.input, outputTokens: usage.output, latencyMs: result.latencyMs, createdAt: new Date() });
-      return Response.json({ text: result.content, usage: { ...usage, latencyMs: result.latencyMs }, model: result.model });
+      const texts = splitChatBubbles(result.content), baseTurnIndex = Number(body.turnIndex || 0) * 10;
+      await db.insert(messages).values(texts.map((content, bubbleIndex) => ({ id: id("msg"), experimentId: String(body.experimentId), personaId: String(persona.id), variant, turnIndex: baseTurnIndex + bubbleIndex, speaker: role, content, model: result.model, promptVersion: String(body.promptVersion || "user-natural-v2"), inputTokens: bubbleIndex === 0 ? usage.input : 0, outputTokens: bubbleIndex === 0 ? usage.output : 0, latencyMs: bubbleIndex === 0 ? result.latencyMs : 0, createdAt: new Date() })));
+      return Response.json({ text: texts[0], texts, usage: { ...usage, latencyMs: result.latencyMs }, model: result.model });
     }
     if (action === "profile") {
       const persona = body.persona as PersonaSeed, history = (body.history || []) as HistoryItem[], model = safeModel(body.model), variant = body.variant === "B" ? "B" : "A";
