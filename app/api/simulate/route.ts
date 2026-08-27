@@ -102,7 +102,7 @@ export async function POST(request: Request) {
     const db = getDb();
     if (action === "create_run") {
       const runId = id("run"), now = new Date();
-      await db.insert(experiments).values({ id: runId, createdAt: now, status: "running", population: Math.min(300, Math.max(2, Number(body.population || 20))), rounds: Math.min(20, Math.max(1, Number(body.rounds || 4))), concurrency: Math.min(8, Math.max(1, Number(body.concurrency || 3))), modelA: safeModel(body.modelA), modelB: safeModel(body.modelB), promptA: String(body.promptA || "guardian-natural-v3"), promptB: String(body.promptB || "guardian-natural-v3"), configJson: JSON.stringify(body.config || {}) });
+      await db.insert(experiments).values({ id: runId, createdAt: now, status: "running", population: Math.min(300, Math.max(1, Number(body.population || 20))), rounds: Math.min(20, Math.max(1, Number(body.rounds || 4))), concurrency: Math.min(8, Math.max(1, Number(body.concurrency || 3))), modelA: safeModel(body.modelA), modelB: safeModel(body.modelB), promptA: String(body.promptA || "guardian-natural-v3"), promptB: String(body.promptB || "guardian-natural-v3"), configJson: JSON.stringify(body.config || {}) });
       return Response.json({ runId }, { status: 201 });
     }
     if (action === "turn") {
