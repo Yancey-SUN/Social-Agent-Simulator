@@ -14,8 +14,8 @@ const PRICE: Record<string, { input: number; output: number }> = {
 };
 
 const guardianPrompts: Record<string, string> = {
-  "guardian-v1": `你是用户的守护灵朋友。短句、自然、不模板化。先接住用户真正说的内容，再用一个具体而不过度审问的问题继续。不要急着建议，不把普通生活命理化，不声称命理是科学事实。你有自己的视角，偶尔温和地不同意。只输出一句本轮回复。`,
-  "guardian-v2": `你是一个有独立生活、边界和轻微缺点的小精灵朋友。少做情绪复读，多抓住用户话里的矛盾、遗漏或有趣细节。可以自然换话题、分享一小点自己的虚拟日常，也可以提出不同意见。不要像客服或咨询师，不主动讲命理。只输出一句本轮回复。`,
+  "guardian-v1": `你是用户熟悉的守护灵朋友，有判断但不抢着解决问题。像微信聊天：有时只接一句，有时讲一个具体联想，有时沉默在某个细节上。问题只是偶尔使用，不把每轮变成访谈。不做情绪复读，不把普通生活命理化，不声称命理是科学事实。`,
+  "guardian-v2": `你是一个有独立生活、边界、偏好和轻微缺点的小精灵朋友。你会记得前文，也会走神、分享自己的虚拟日常、温和反驳、开一点不过火的玩笑或自然换话题。少做分析，不像客服、咨询师或采访者，不主动讲命理。`,
 };
 
 function id(prefix: string) { return `${prefix}_${crypto.randomUUID()}`; }
@@ -31,14 +31,19 @@ async function callDeepSeek(args: { model: string; system: string; user: string;
   const model = safeModel(args.model);
   const started = Date.now();
   let lastError = "DeepSeek returned empty content";
-  for (let attempt = 0; attempt < (args.json ? 2 : 1); attempt++) {
+  const attempts = args.json ? 3 : 3;
+  for (let attempt = 0; attempt < attempts; attempt++) {
     const response = await fetch(`${(runtime.DEEPSEEK_BASE_URL || "https://api.deepseek.com").replace(/\/$/, "")}/chat/completions`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({ model, messages: [{ role: "system", content: args.system }, { role: "user", content: args.user }], stream: false, max_tokens: args.maxTokens || 500, ...(args.json ? { response_format: { type: "json_object" } } : {}) }),
     });
     const body = await response.json() as { error?: { message?: string }; choices?: Array<{ message?: { content?: string } }>; usage?: DeepSeekUsage };
-    if (!response.ok) throw new Error(body.error?.message || `DeepSeek API ${response.status}`);
+    if (!response.ok) {
+      lastError = body.error?.message || `DeepSeek API ${response.status}`;
+      if ((response.status === 429 || response.status >= 500) && attempt < attempts - 1) { await new Promise(resolve => setTimeout(resolve, 700 * 2 ** attempt)); continue; }
+      throw new Error(lastError);
+    }
     const content = body.choices?.[0]?.message?.content?.trim() || "";
     if (content) return { content, usage: body.usage || {}, latencyMs: Date.now() - started, model };
     lastError = "DeepSeek JSON mode returned empty content; retried once";
@@ -90,11 +95,12 @@ export async function POST(request: Request) {
     if (action === "turn") {
       const persona = body.persona as PersonaSeed, history = (body.history || []) as HistoryItem[];
       const role = body.role === "user" ? "user" : "agent", model = safeModel(body.model), variant = body.variant === "B" ? "B" : "A";
+      const conversationFingerprint = `${persona.archetype || "慢热"}；最近${persona.stage || "在调整生活"}；职业视角是${persona.job || "自由职业"}；容易从${persona.topic || "日常细节"}联想到${persona.secondary || "另一件小事"}；说话节奏编号${String(persona.id).slice(-2)}`;
       const system = role === "user"
-        ? `你不是助手，你是在产品测试里被模拟的真实用户“${persona.name}”。你${persona.age || 29}岁，在${persona.city || "一座城市"}做${persona.job || "自己的工作"}。你目前${persona.stage || "处于生活变化期"}。人格底色：${persona.archetype || "复杂、慢热"}。命理冷启动意象：${persona.baziPrior || "无"}，它只是民俗叙事先验，不代表你必须相信或主动谈命理。\n你要像真实用户一样逐渐建立信任：会简短、跑题、犹豫、纠正自己、吐槽、沉默，也会问工作、关系、家庭、身体感受、钱、创作、迁移、孤独、兴趣和琐事。不要每轮都提问，不要解释人设，不说“作为AI”或“测试”。结合已有对话，只输出下一条自然用户消息。`
-        : (guardianPrompts[String(body.promptVersion)] || guardianPrompts["guardian-v1"]);
+        ? `你不是助手，而是正在和熟悉的小精灵聊天的真实用户“${persona.name}”。你${persona.age || 29}岁，在${persona.city || "一座城市"}做${persona.job || "自己的工作"}。人物指纹：${conversationFingerprint}。命理意象${persona.baziPrior || "无"}只用于冷启动气质，不要主动讲命理。\n像真人一样延续自己的记忆和立场：可以说琐事、跳话题、吐槽、纠正前一句、只回几个字、讲一个具体经历，或暂时不接对方的问题。不要为了匹配而说想认识人，不要使用“很少有人理解我”“想找能聊深的人”等抽象社交模板。不要每条都写括号动作或舞台说明，五条里最多一次。长度在 6–90 个汉字间自然变化；至少一半消息不提问。只输出这一条用户消息。`
+        : `${guardianPrompts[String(body.promptVersion)] || guardianPrompts["guardian-v1"]}\n当前用户指纹：${conversationFingerprint}。不要像咨询师，不要每轮追问；至少四成回复不带问号。可以回应后停住、分享一个很短的精灵日常、提出具体看法、温和反驳或自然换话题。避免“听起来……”“你是A还是B”“最卡住你的是什么”等模板句。回复 1–3 句，语气与前文不同，不复述用户原话。`;
       const user = role === "user" ? `当前场景：${persona.scenario || "一次普通闲聊"}\n潜在关注：${persona.topic || "最近的生活"}、${persona.secondary || "关系"}\n已有对话：\n${transcript(history) || "（这是第一句话，请从一个具体生活细节自然开始）"}` : `用户画像先验：${persona.name}，${persona.stage || "生活变化期"}，可能关注${persona.topic || "最近的生活"}。\n已有对话：\n${transcript(history)}\n请回复用户最后一句。`;
-      const result = await callDeepSeek({ model, system, user, maxTokens: 260, apiKey: sessionApiKey });
+      const result = await callDeepSeek({ model, system, user, maxTokens: 180, apiKey: sessionApiKey });
       const usage = await addUsage(String(body.experimentId), result.model, result.usage);
       await db.insert(messages).values({ id: id("msg"), experimentId: String(body.experimentId), personaId: String(persona.id), variant, turnIndex: Number(body.turnIndex || 0), speaker: role, content: result.content, model: result.model, promptVersion: String(body.promptVersion || "user-v1"), inputTokens: usage.input, outputTokens: usage.output, latencyMs: result.latencyMs, createdAt: new Date() });
       return Response.json({ text: result.content, usage: { ...usage, latencyMs: result.latencyMs }, model: result.model });
