@@ -1,7 +1,7 @@
 import { env } from "cloudflare:workers";
 import { desc, eq, sql } from "drizzle-orm";
 import { getDb } from "../../../db";
-import { experiments, matches, messages, outcomes, profiles } from "../../../db/schema";
+import { experiments, failures, matches, messages, outcomes, profiles } from "../../../db/schema";
 import { buildUserSimulationPrompt, NATURAL_GUARDIAN_PROMPT } from "./prompts";
 
 type HistoryItem = { speaker: "user" | "agent"; content: string };
@@ -44,13 +44,19 @@ async function callDeepSeek(args: { model: string; system: string; user: string;
       headers: { "Content-Type": "application/json", Authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({ model, messages: [{ role: "system", content: args.system }, { role: "user", content: args.user }], stream: false, max_tokens: args.maxTokens || 500, ...(args.json ? { response_format: { type: "json_object" } } : {}) }),
     });
-    const body = await response.json() as { error?: { message?: string }; choices?: Array<{ message?: { content?: string } }>; usage?: DeepSeekUsage };
+    const body = await response.json() as { error?: { message?: string }; choices?: Array<{ message?: { content?: string }; finish_reason?: string }>; usage?: DeepSeekUsage };
     if (!response.ok) {
       lastError = body.error?.message || `DeepSeek API ${response.status}`;
       if ((response.status === 429 || response.status >= 500) && attempt < attempts - 1) { await new Promise(resolve => setTimeout(resolve, 700 * 2 ** attempt)); continue; }
       throw new Error(lastError);
     }
-    const content = body.choices?.[0]?.message?.content?.trim() || "";
+    const choice = body.choices?.[0];
+    const content = choice?.message?.content?.trim() || "";
+    if (choice?.finish_reason === "length") {
+      lastError = "模型回复因长度限制被截断";
+      if (attempt < attempts - 1) continue;
+      throw new Error(lastError);
+    }
     if (content) return { content, usage: body.usage || {}, latencyMs: Date.now() - started, model };
     lastError = "DeepSeek JSON mode returned empty content; retried once";
   }
@@ -78,7 +84,8 @@ export async function GET(request: Request) {
       const savedProfiles = await db.select().from(profiles).where(eq(profiles.experimentId, runId));
       const savedMatches = await db.select().from(matches).where(eq(matches.experimentId, runId));
       const savedOutcomes = await db.select().from(outcomes).where(eq(outcomes.experimentId, runId));
-      return Response.json({ configured, run: run[0] || null, messages: savedMessages, profiles: savedProfiles, matches: savedMatches, outcomes: savedOutcomes });
+      const savedFailures = await db.select().from(failures).where(eq(failures.experimentId, runId));
+      return Response.json({ configured, run: run[0] || null, messages: savedMessages, profiles: savedProfiles, matches: savedMatches, outcomes: savedOutcomes, failures: savedFailures });
     }
     const runs = await db.select().from(experiments).orderBy(desc(experiments.createdAt)).limit(12);
     return Response.json({ configured, models: [...MODELS], runs });
@@ -105,7 +112,7 @@ export async function POST(request: Request) {
         ? buildUserSimulationPrompt(persona)
         : (guardianPrompts[String(body.promptVersion)] || guardianPrompts["guardian-natural-v3"]);
       const user = role === "user" ? `这是你和守护者目前的微信聊天记录：\n${transcript(history) || "（还没有聊天记录）"}\n\n现在轮到你发消息。可以发 1–3 个连续微信气泡，每个气泡单独一行。` : `这是你和用户目前的微信聊天记录：\n${transcript(history)}\n\n现在轮到你回复。可以发 1–3 个连续微信气泡，每个气泡单独一行。`;
-      const result = await callDeepSeek({ model, system, user, maxTokens: 80, apiKey: sessionApiKey });
+      const result = await callDeepSeek({ model, system, user, maxTokens: 180, apiKey: sessionApiKey });
       const usage = await addUsage(String(body.experimentId), result.model, result.usage);
       const texts = splitChatBubbles(result.content), baseTurnIndex = Number(body.turnIndex || 0) * 10;
       await db.insert(messages).values(texts.map((content, bubbleIndex) => ({ id: id("msg"), experimentId: String(body.experimentId), personaId: String(persona.id), variant, turnIndex: baseTurnIndex + bubbleIndex, speaker: role, content, model: result.model, promptVersion: String(body.promptVersion || "user-natural-v2"), inputTokens: bubbleIndex === 0 ? usage.input : 0, outputTokens: bubbleIndex === 0 ? usage.output : 0, latencyMs: bubbleIndex === 0 ? result.latencyMs : 0, createdAt: new Date() })));
@@ -113,7 +120,7 @@ export async function POST(request: Request) {
     }
     if (action === "profile") {
       const persona = body.persona as PersonaSeed, history = (body.history || []) as HistoryItem[], model = safeModel(body.model), variant = body.variant === "B" ? "B" : "A";
-      const system = `你是 Memory Session Compactor 与 Profile Curator。只根据对话证据输出 json，不做命理推断，不把一次性情绪写成稳定人格。Unknown 不等于 Yes。每项保留 evidence、confidence、recency、permission。JSON 示例：{"episode_summary":"","stable_profile":[{"claim":"","evidence":"","confidence":0.0}],"active_state":[{"claim":"","evidence":"","expires_days":7}],"social_intent":{"state":"explicit|implicit|unknown|negative","topic":"","strength":0.0,"evidence":""},"social_preference":{"relationship":"ahead|peer|contrast|complement|unknown","evidence":""},"no_go":[],"open_questions":[],"readiness":0.0}`;
+      const system = `你是 Memory Session Compactor 与 Profile Curator。只根据对话证据输出 json，不做命理推断，不把一次性情绪写成稳定人格。Unknown 不等于 Yes。每项保留 evidence、confidence、recency、permission。Readiness 表示“现有证据是否足够支持一次负责任的社交推荐”，不是聊天气氛或消息数量。评分标尺：0–0.29 只有零散闲聊；0.30–0.49 有基础状态但缺少社交意图与偏好；0.50–0.61 有两项左右可追溯维度，可作探索但不可直接推荐；0.62–0.79 至少三个可追溯维度，且包含社交意图或关系偏好之一，可以进入候选研究；0.80–1.0 是丰富、跨话题或长期证据。不得只因用户问 AI 是否有空而判断存在社交意图。JSON 示例：{"episode_summary":"","stable_profile":[{"claim":"","evidence":"","confidence":0.0}],"active_state":[{"claim":"","evidence":"","expires_days":7}],"social_intent":{"state":"explicit|implicit|unknown|negative","topic":"","strength":0.0,"evidence":""},"social_preference":{"relationship":"ahead|peer|contrast|complement|unknown","evidence":""},"no_go":[],"open_questions":[],"readiness":0.0}`;
       const result = await callDeepSeek({ model, system, user: `用户：${persona.name}\n对话：\n${transcript(history)}\n输出完整 json。`, json: true, maxTokens: 1200, apiKey: sessionApiKey });
       const profile = JSON.parse(result.content); const usage = await addUsage(String(body.experimentId), result.model, result.usage);
       await db.insert(profiles).values({ id: id("profile"), experimentId: String(body.experimentId), personaId: String(persona.id), variant, profileJson: JSON.stringify(profile), readiness: Math.max(0, Math.min(1, Number(profile.readiness || 0))), evidenceJson: JSON.stringify([...(profile.stable_profile || []), ...(profile.active_state || [])]), createdAt: new Date() });
@@ -129,6 +136,11 @@ export async function POST(request: Request) {
     }
     if (action === "outcome") {
       await db.insert(outcomes).values({ id: id("outcome"), experimentId: String(body.experimentId), matchId: String(body.matchId), checkpoint: String(body.checkpoint || "day0"), acceptedA: Boolean(body.acceptedA), acceptedB: Boolean(body.acceptedB), messagesExchanged: Number(body.messagesExchanged || 0), relationshipAlive: Boolean(body.relationshipAlive), note: String(body.note || ""), createdAt: new Date() });
+      return Response.json({ saved: true }, { status: 201 });
+    }
+    if (action === "failure") {
+      const rawMessage = String(body.message || "未知错误").replace(/\s+/g, " ").trim();
+      await db.insert(failures).values({ id: id("failure"), experimentId: String(body.experimentId), personaId: String(body.personaId || ""), variant: body.variant === "B" ? "B" : "A", stage: String(body.stage || "unknown").slice(0, 48), errorCode: String(body.errorCode || "UNKNOWN").slice(0, 48), message: rawMessage.slice(0, 600), createdAt: new Date() });
       return Response.json({ saved: true }, { status: 201 });
     }
     if (action === "complete") {

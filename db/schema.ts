@@ -19,3 +19,7 @@ export const matches = sqliteTable("matches", {
 export const outcomes = sqliteTable("outcomes", {
   id: text("id").primaryKey(), experimentId: text("experiment_id").notNull(), matchId: text("match_id").notNull(), checkpoint: text("checkpoint").notNull(), acceptedA: integer("accepted_a", { mode: "boolean" }).notNull(), acceptedB: integer("accepted_b", { mode: "boolean" }).notNull(), messagesExchanged: integer("messages_exchanged").notNull().default(0), relationshipAlive: integer("relationship_alive", { mode: "boolean" }).notNull().default(false), note: text("note").notNull().default(""), createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
 }, (t) => [index("idx_outcomes_match_checkpoint").on(t.matchId, t.checkpoint)]);
+
+export const failures = sqliteTable("failures", {
+  id: text("id").primaryKey(), experimentId: text("experiment_id").notNull(), personaId: text("persona_id").notNull().default(""), variant: text("variant").notNull().default("A"), stage: text("stage").notNull(), errorCode: text("error_code").notNull().default("UNKNOWN"), message: text("message").notNull(), createdAt: integer("created_at", { mode: "timestamp_ms" }).notNull(),
+}, (t) => [index("idx_failures_experiment_created_at").on(t.experimentId, t.createdAt)]);
