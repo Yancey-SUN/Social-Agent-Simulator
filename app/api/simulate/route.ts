@@ -5,6 +5,7 @@ import { experiments, failures, matches, messages, outcomes, profiles } from "..
 import { buildUserSimulationPrompt, NATURAL_GUARDIAN_PROMPT } from "./prompts";
 
 type HistoryItem = { speaker: "user" | "agent"; content: string };
+type GroupHistoryItem = { speaker: string; content: string };
 type PersonaSeed = { id: number | string; name: string; age?: number; city?: string; job?: string; archetype?: string; topic?: string; secondary?: string; stage?: string; scenario?: string; preference?: string; baziPrior?: string };
 type DeepSeekUsage = { prompt_tokens?: number; completion_tokens?: number; prompt_cache_hit_tokens?: number; prompt_cache_miss_tokens?: number };
 type ProviderName = "deepseek" | "openai" | "qwen" | "moonshot" | "siliconflow";
@@ -142,11 +143,12 @@ export async function POST(request: Request) {
       return Response.json({ text: texts[0], texts, usage: { ...usage, latencyMs: result.latencyMs }, model: result.model });
     }
     if (action === "profile") {
-      const persona = body.persona as PersonaSeed, history = (body.history || []) as HistoryItem[], model = safeModel(body.model), variant = body.variant === "B" ? "B" : "A";
+      const persona = body.persona as PersonaSeed, history = (body.history || []) as HistoryItem[], model = safeModel(body.model), variant = body.variant === "B" ? "B" : "A", partialSession = Boolean(body.partialSession);
       const existing = await db.select().from(profiles).where(and(eq(profiles.experimentId, String(body.experimentId)), eq(profiles.personaId, String(persona.id)), eq(profiles.variant, variant))).limit(1);
       if (existing.length) return Response.json({ profile: parseJson(existing[0].profileJson), usage: { input: 0, output: 0, micros: 0, latencyMs: 0 }, replayed: true });
-      const system = `你是 Memory Session Compactor 与 Profile Curator。只根据对话证据输出紧凑 JSON，不做命理推断，不把一次性情绪写成稳定人格。Unknown 不等于 Yes。Readiness 表示证据是否足够支持负责任的社交推荐：0–0.29 零散闲聊；0.30–0.49 有基础状态但缺社交意图/偏好；0.50–0.61 仅探索；0.62–0.79 至少三个证据维度且包含社交意图或关系偏好；0.80–1.0 丰富长期证据。不得只因用户问 AI 是否有空而判断社交意图。episode_summary 不超过120字；stable_profile、active_state、no_go、open_questions 各最多3项；每条 claim/evidence 不超过80字。只输出一个 JSON 对象，不要解释。结构：{"episode_summary":"","stable_profile":[{"claim":"","evidence":"","confidence":0.0}],"active_state":[{"claim":"","evidence":"","expires_days":7}],"social_intent":{"state":"explicit|implicit|unknown|negative","topic":"","strength":0.0,"evidence":""},"social_preference":{"relationship":"ahead|peer|contrast|complement|unknown","evidence":""},"no_go":[],"open_questions":[],"readiness":0.0}`;
-      const result = await callDeepSeek({ provider, model, system, user: `用户：${persona.name}\n对话：\n${transcript(history)}\n只输出完整紧凑 JSON。`, json: true, maxTokens: 1600, apiKey: sessionApiKey });
+      if (!history.length) return jsonError("没有任何已完成消息，无法生成画像", 422);
+      const system = `你是 Memory Session Compactor 与 Profile Curator。只根据已经发生的对话证据输出紧凑 JSON，即使对话中途停止、话题尚未聊完，也必须基于现有内容尽力形成阶段性画像与 readiness；不能因为会话不完整而拒绝输出。证据不足的字段保持 unknown，并在 open_questions 标记，不要用人设设定补齐对话中没有透露的信息。不做命理推断，不把一次性情绪写成稳定人格。Unknown 不等于 Yes。Readiness 表示现有证据是否足够支持负责任的社交推荐：0–0.29 零散闲聊；0.30–0.49 有基础状态但缺社交意图/偏好；0.50–0.61 仅探索；0.62–0.79 至少三个证据维度且包含社交意图或关系偏好；0.80–1.0 丰富长期证据。不得只因用户问 AI 是否有空而判断社交意图。episode_summary 不超过120字；stable_profile、active_state、no_go、open_questions 各最多3项；每条 claim/evidence 不超过80字。只输出一个 JSON 对象，不要解释。结构：{"episode_summary":"","stable_profile":[{"claim":"","evidence":"","confidence":0.0}],"active_state":[{"claim":"","evidence":"","expires_days":7}],"social_intent":{"state":"explicit|implicit|unknown|negative","topic":"","strength":0.0,"evidence":""},"social_preference":{"relationship":"ahead|peer|contrast|complement|unknown","evidence":""},"no_go":[],"open_questions":[],"readiness":0.0,"partial_session":${partialSession}}`;
+      const result = await callDeepSeek({ provider, model, system, user: `用户：${persona.name}\n已完成的 ${history.length} 条消息（会话可能中途停止）：\n${transcript(history)}\n只输出完整紧凑 JSON。`, json: true, maxTokens: 1600, apiKey: sessionApiKey });
       const profile = parseJson(result.content); const usage = await addUsage(String(body.experimentId), result.model, result.usage);
       await db.insert(profiles).values({ id: id("profile"), experimentId: String(body.experimentId), personaId: String(persona.id), variant, profileJson: JSON.stringify(profile), readiness: Math.max(0, Math.min(1, Number(profile.readiness || 0))), evidenceJson: JSON.stringify([...(profile.stable_profile || []), ...(profile.active_state || [])]), createdAt: new Date() });
       return Response.json({ profile, usage: { ...usage, latencyMs: result.latencyMs } });
@@ -160,6 +162,45 @@ export async function POST(request: Request) {
       const research = parseJson(result.content), matchId = id("match"), usage = await addUsage(String(body.experimentId), result.model, result.usage);
       await db.insert(matches).values({ id: matchId, experimentId: String(body.experimentId), personaAId: String(body.personaAId), personaBId: String(body.personaBId), variant, score: Math.max(0, Math.min(1, Number(research.score || 0))), relationType: String(research.relationship_type || "unexpected"), researchJson: JSON.stringify(research), status: research.recommend ? "opportunity" : "filtered", createdAt: new Date() });
       return Response.json({ matchId, research, usage: { ...usage, latencyMs: result.latencyMs } });
+    }
+    if (action === "create_group") {
+      const matchId = String(body.matchId), variant = body.variant === "B" ? "B" : "A", groupKey = `group:${matchId}`;
+      const existing = await db.select().from(messages).where(and(eq(messages.experimentId, String(body.experimentId)), eq(messages.personaId, groupKey), eq(messages.variant, variant))).orderBy(messages.turnIndex);
+      if (existing.length) return Response.json({ messages: existing.map(row => ({ speaker: row.speaker, content: row.content })), replayed: true });
+      const personaA = body.personaA as PersonaSeed, personaB = body.personaB as PersonaSeed, research = body.research || {};
+      const resonance = String(research.resonance || "你们最近关注的事情有一些很自然的连接点").replace(/\s+/g, " ").slice(0, 100);
+      const opening = [
+        { speaker: "agent_a", content: `我把你们拉进来啦。${resonance}，感觉你们可能会聊得来。你们随意，不用照顾我。` },
+        { speaker: "agent_b", content: `我也先潜水，除非你们 @ 我。${personaA.name}、${personaB.name}，从最近最想吐槽的小事开始就行哈哈。` },
+      ];
+      await db.insert(messages).values(opening.map((item, turnIndex) => ({ id: id("msg"), experimentId: String(body.experimentId), personaId: groupKey, variant, turnIndex, speaker: item.speaker, content: item.content, model: "system", promptVersion: "group-cold-start-v1", inputTokens: 0, outputTokens: 0, latencyMs: 0, createdAt: new Date() })));
+      await db.update(matches).set({ status: "group" }).where(eq(matches.id, matchId));
+      const day0 = await db.select().from(outcomes).where(and(eq(outcomes.experimentId, String(body.experimentId)), eq(outcomes.matchId, matchId), eq(outcomes.checkpoint, "day0"))).limit(1);
+      if (!day0.length) await db.insert(outcomes).values({ id: id("outcome"), experimentId: String(body.experimentId), matchId, checkpoint: "day0", acceptedA: true, acceptedB: true, messagesExchanged: 0, relationshipAlive: true, note: "simulation auto mutual consent", createdAt: new Date() });
+      return Response.json({ messages: opening }, { status: 201 });
+    }
+    if (action === "group_turn") {
+      const matchId = String(body.matchId), variant = body.variant === "B" ? "B" : "A", groupKey = `group:${matchId}`;
+      const persona = body.persona as PersonaSeed, peer = body.peer as PersonaSeed, speaker = body.speaker === "user_b" ? "user_b" : "user_a", turnIndex = Math.max(2, Number(body.turnIndex || 2));
+      const existing = await db.select().from(messages).where(and(eq(messages.experimentId, String(body.experimentId)), eq(messages.personaId, groupKey), eq(messages.variant, variant), eq(messages.speaker, speaker), eq(messages.turnIndex, turnIndex))).limit(1);
+      if (existing.length) return Response.json({ text: existing[0].content, usage: { input: 0, output: 0, micros: 0, latencyMs: 0 }, replayed: true });
+      const history = (body.history || []) as GroupHistoryItem[];
+      const groupSystem = `${buildUserSimulationPrompt(persona)}\n\n# 四人群聊补充规则\n你现在已经同意认识 ${peer.name}，正在一个有你、${peer.name} 和双方 AI 守护者的四人微信群里。守护者开场后会潜水。你是在和另一个真人聊天，不是在继续向 AI 倾诉。自然接住对方刚说的具体内容，也可以分享一个相关小事、轻微跑题、开玩笑或表达不同意见。不要急着建立深度关系，不要采访，不要写动作或旁白。通常只发一个短气泡。你知道两个守护者是 AI；只有确实想让它们补充信息时才 @守护者。`;
+      const groupTranscript = history.map((item, index) => `${index + 1}. ${item.speaker}：${item.content}`).join("\n");
+      const result = await callDeepSeek({ provider, model: safeModel(body.model), system: groupSystem, user: `群聊记录：\n${groupTranscript}\n\n现在轮到你回复 ${peer.name}。只输出这次真正会发的一条微信消息。`, maxTokens: 120, apiKey: sessionApiKey });
+      const usage = await addUsage(String(body.experimentId), result.model, result.usage), content = splitChatBubbles(result.content)[0];
+      await db.insert(messages).values({ id: id("msg"), experimentId: String(body.experimentId), personaId: groupKey, variant, turnIndex, speaker, content, model: result.model, promptVersion: "group-human-v1", inputTokens: usage.input, outputTokens: usage.output, latencyMs: result.latencyMs, createdAt: new Date() });
+      return Response.json({ text: content, usage: { ...usage, latencyMs: result.latencyMs } });
+    }
+    if (action === "group_agent") {
+      const matchId = String(body.matchId), variant = body.variant === "B" ? "B" : "A", groupKey = `group:${matchId}`;
+      const speaker = body.speaker === "agent_b" ? "agent_b" : "agent_a", turnIndex = Number(body.turnIndex || 2), history = (body.history || []) as GroupHistoryItem[];
+      const last = history[history.length - 1]?.content || "";
+      if (!/@(?:守护者|小精灵|agent|Agent|苔苔)/.test(last)) return Response.json({ skipped: true });
+      const result = await callDeepSeek({ provider, model: safeModel(body.model), system: `${NATURAL_GUARDIAN_PROMPT}\n\n你在用户匹配后的四人群里。平时保持潜水；现在因为被 @ 才回复。只补充被问到的信息或轻轻推动一次，不主导两个用户的聊天，只发一个短气泡。`, user: `群聊：\n${history.map((item, index) => `${index + 1}. ${item.speaker}：${item.content}`).join("\n")}\n\n你被 @ 了，回复一次。`, maxTokens: 100, apiKey: sessionApiKey });
+      const usage = await addUsage(String(body.experimentId), result.model, result.usage), content = splitChatBubbles(result.content)[0];
+      await db.insert(messages).values({ id: id("msg"), experimentId: String(body.experimentId), personaId: groupKey, variant, turnIndex, speaker, content, model: result.model, promptVersion: "group-agent-mention-v1", inputTokens: usage.input, outputTokens: usage.output, latencyMs: result.latencyMs, createdAt: new Date() });
+      return Response.json({ text: content, usage: { ...usage, latencyMs: result.latencyMs } });
     }
     if (action === "outcome") {
       await db.insert(outcomes).values({ id: id("outcome"), experimentId: String(body.experimentId), matchId: String(body.matchId), checkpoint: String(body.checkpoint || "day0"), acceptedA: Boolean(body.acceptedA), acceptedB: Boolean(body.acceptedB), messagesExchanged: Number(body.messagesExchanged || 0), relationshipAlive: Boolean(body.relationshipAlive), note: String(body.note || ""), createdAt: new Date() });
