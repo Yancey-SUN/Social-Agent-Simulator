@@ -236,6 +236,23 @@ export async function POST(request: Request) {
       await db.insert(messages).values({ id: id("msg"), experimentId: String(body.experimentId), personaId: groupKey, variant, turnIndex, speaker, content, model: result.model, promptVersion: "group-agent-mention-v1", inputTokens: usage.input, outputTokens: usage.output, latencyMs: result.latencyMs, createdAt: new Date() });
       return Response.json({ text: content, usage: { ...usage, latencyMs: result.latencyMs } });
     }
+    if (action === "group_evaluate") {
+      const experimentId = String(body.experimentId), matchId = String(body.matchId), side = body.side === "B" ? "B" : "A", checkpoint = `post_group_${side.toLowerCase()}`;
+      const persona = body.persona as PersonaSeed, peer = body.peer as PersonaSeed, history = (body.history || []) as GroupHistoryItem[], humanMessages = history.filter(item => !String(item.speaker).includes("守护者") && !String(item.speaker).toLowerCase().includes("agent")).length;
+      const existing = await db.select().from(outcomes).where(and(eq(outcomes.experimentId, experimentId), eq(outcomes.matchId, matchId), eq(outcomes.checkpoint, checkpoint))).limit(1);
+      if (existing.length && existing[0].messagesExchanged >= humanMessages) return Response.json({ evaluation: parseJson(existing[0].note), usage: { input: 0, output: 0, micros: 0, latencyMs: 0 }, replayed: true });
+      let evaluation: Record<string, any>, usage = { input: 0, output: 0, micros: 0, latencyMs: 0 };
+      try {
+        const result = await callDeepSeek({ provider, model: safeModel(body.model), system: `${buildUserSimulationPrompt(persona)}\n\n你刚结束了和 ${peer.name} 的一次匹配群聊。现在是只有系统能看到的私密回访问卷。不要为了让实验成功而说愿意；只根据群聊里的真实感受判断是否想继续接触。只输出 JSON：{"willingness":0.0,"continue":false,"reason":"","preferred_next_step":"继续群聊|加联系方式|参加共同活动|暂不继续","positive_signals":[""],"concerns":[""]}`, user: `群聊记录：\n${history.map((item, index) => `${index + 1}. ${item.speaker}：${item.content}`).join("\n")}\n\n请以 ${persona.name} 的真实立场完成私密回访，只输出完整 JSON。`, json: true, maxTokens: 700, apiKey: sessionApiKey });
+        evaluation = { ...parseJson(result.content), engine: "llm-private-followup-v1" }; usage = { ...(await addUsage(experimentId, result.model, result.usage)), latencyMs: result.latencyMs };
+      } catch (error) {
+        const ownMessages = history.filter(item => String(item.speaker).includes(persona.name)); const engagement = Math.min(1, ownMessages.length / 4); const willingness = Math.max(.25, Math.min(.72, .32 + engagement * .32));
+        evaluation = { willingness: Number(willingness.toFixed(2)), continue: willingness >= .5, reason: ownMessages.length >= 3 ? "群聊中有持续回应，但需要更多互动才能形成稳定判断。" : "现有互动较少，暂时只能做低置信度判断。", preferred_next_step: willingness >= .5 ? "继续群聊" : "暂不继续", positive_signals: [], concerns: ["模型回访不可用，当前为低置信度行为估计"], engine: "behavior-fallback-v1", fallback_reason: error instanceof Error ? error.message : "LLM unavailable" };
+      }
+      const values = { acceptedA: side === "A" ? Boolean(evaluation.continue) : false, acceptedB: side === "B" ? Boolean(evaluation.continue) : false, messagesExchanged: humanMessages, relationshipAlive: Boolean(evaluation.continue), note: JSON.stringify(evaluation) };
+      if (existing.length) await db.update(outcomes).set(values).where(eq(outcomes.id, existing[0].id)); else await db.insert(outcomes).values({ id: id("outcome"), experimentId, matchId, checkpoint, ...values, createdAt: new Date() });
+      return Response.json({ evaluation, usage }, { status: existing.length ? 200 : 201 });
+    }
     if (action === "outcome") {
       await db.insert(outcomes).values({ id: id("outcome"), experimentId: String(body.experimentId), matchId: String(body.matchId), checkpoint: String(body.checkpoint || "day0"), acceptedA: Boolean(body.acceptedA), acceptedB: Boolean(body.acceptedB), messagesExchanged: Number(body.messagesExchanged || 0), relationshipAlive: Boolean(body.relationshipAlive), note: String(body.note || ""), createdAt: new Date() });
       return Response.json({ saved: true }, { status: 201 });
