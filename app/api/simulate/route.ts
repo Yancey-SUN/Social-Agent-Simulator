@@ -41,6 +41,23 @@ function splitChatBubbles(content: string) {
 function bubbleCap(personaId: string, turnIndex: number, role: string) { const seed = `${personaId}:${turnIndex}:${role}`; let value = 0; for (const char of seed) value = (value * 31 + char.charCodeAt(0)) % 100; return value < 80 ? 1 : value < 95 ? 2 : 3; }
 function runtimeEnv() { return env as unknown as { LLM_API_KEY?: string; LLM_PROVIDER?: string; LLM_BASE_URL?: string; DEEPSEEK_API_KEY?: string; DEEPSEEK_BASE_URL?: string } }
 function parseJson(content: string) { const clean = content.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim(); const start = clean.indexOf("{"); const end = clean.lastIndexOf("}"); return JSON.parse(start >= 0 && end > start ? clean.slice(start, end + 1) : clean); }
+function profileTerms(profile: Record<string, unknown>) { const text = JSON.stringify(profile || {}).toLowerCase(); const terms = new Set<string>(text.match(/[a-z0-9]{3,}|[\u4e00-\u9fff]{2}/g) || []); for (const part of text.match(/[\u4e00-\u9fff]{3,}/g) || []) for (let i = 0; i < part.length - 1; i++) terms.add(part.slice(i, i + 2)); return terms; }
+function claim(profile: Record<string, any>, field: "stable_profile" | "active_state") { const item = Array.isArray(profile?.[field]) ? profile[field][0] : null; return String(item?.claim || "").trim(); }
+function deterministicResearch(profileA: Record<string, any>, profileB: Record<string, any>) {
+  const termsA = profileTerms(profileA), termsB = profileTerms(profileB); let overlap = 0; for (const term of termsA) if (termsB.has(term)) overlap++;
+  const overlapRatio = overlap / Math.max(1, Math.min(termsA.size, termsB.size));
+  const evidenceA = (profileA.stable_profile?.length || 0) + (profileA.active_state?.length || 0), evidenceB = (profileB.stable_profile?.length || 0) + (profileB.active_state?.length || 0);
+  const intentA = profileA.social_intent?.state, intentB = profileB.social_intent?.state;
+  const preferenceA = String(profileA.social_preference?.relationship || "unknown"), preferenceB = String(profileB.social_preference?.relationship || "unknown");
+  const intentBonus = [intentA, intentB].some(x => x === "explicit" || x === "implicit") ? .07 : 0;
+  const preferenceBonus = preferenceA !== "unknown" || preferenceB !== "unknown" ? .06 : 0;
+  const evidenceBonus = Math.min(.12, Math.min(evidenceA, evidenceB) * .025);
+  const score = Math.max(.5, Math.min(.88, .46 + Math.min(.19, overlapRatio * .55) + intentBonus + preferenceBonus + evidenceBonus));
+  const activeA = claim(profileA, "active_state") || claim(profileA, "stable_profile") || "正在形成更清晰的生活方向";
+  const activeB = claim(profileB, "active_state") || claim(profileB, "stable_profile") || "愿意从具体日常开始认识别人";
+  const relation = preferenceA !== "unknown" ? preferenceA : preferenceB !== "unknown" ? preferenceB : overlapRatio > .08 ? "peer" : "complement";
+  return { score: Number(score.toFixed(3)), relationship_type: relation, resonance: `一方${activeA}；另一方${activeB}。两人的现阶段存在可以自然展开的连接点。`, mutual_value: overlapRatio > .08 ? "已有共同语境，第一次聊天容易从具体经历开始，同时保留不同视角。" : "生活经验并不完全相同，可能为彼此提供新的活动线索和观察角度。", risk: intentBonus ? "仍需尊重双方当下的社交节奏。" : "社交意图证据较弱，建议以低压力群聊验证真实意愿。", evidence: [`A：${activeA}`, `B：${activeB}`, `画像关键词交集 ${overlap} 项 · 双方证据 ${evidenceA}/${evidenceB} 项`], recommend: score >= .55, engine: "profile-matching-v1" };
+}
 
 async function callDeepSeek(args: { provider?: ProviderName; model: string; system: string; user: string; json?: boolean; maxTokens?: number; apiKey?: string }) {
   const runtime = runtimeEnv();
@@ -154,14 +171,31 @@ export async function POST(request: Request) {
       return Response.json({ profile, usage: { ...usage, latencyMs: result.latencyMs } });
     }
     if (action === "match") {
-      const model = safeModel(body.model), variant = body.variant === "B" ? "B" : "A";
+      const variant = body.variant === "B" ? "B" : "A";
       const existing = await db.select().from(matches).where(and(eq(matches.experimentId, String(body.experimentId)), eq(matches.personaAId, String(body.personaAId)), eq(matches.personaBId, String(body.personaBId)), eq(matches.variant, variant))).limit(1);
       if (existing.length) return Response.json({ matchId: existing[0].id, research: parseJson(existing[0].researchJson), usage: { input: 0, output: 0, micros: 0, latencyMs: 0 }, replayed: true });
-      const system = `你是 Relationship Researcher。评估的单位是 Social Opportunity，不做整段聊天相似度。综合 active state、intent、topic、stage、preference、no_go、mutual value 与适度 surprise。只输出 json。JSON 示例：{"score":0.0,"relationship_type":"peer|ahead|contrast|complement|unexpected","resonance":"","mutual_value":"","risk":"","evidence":[""],"recommend":true}`;
-      const result = await callDeepSeek({ provider, model, system, user: `候选A：${JSON.stringify(body.profileA)}\n候选B：${JSON.stringify(body.profileB)}\n只输出完整关系研究 JSON。`, json: true, maxTokens: 1000, apiKey: sessionApiKey });
-      const research = parseJson(result.content), matchId = id("match"), usage = await addUsage(String(body.experimentId), result.model, result.usage);
+      const research = deterministicResearch(body.profileA || {}, body.profileB || {}), matchId = id("match");
       await db.insert(matches).values({ id: matchId, experimentId: String(body.experimentId), personaAId: String(body.personaAId), personaBId: String(body.personaBId), variant, score: Math.max(0, Math.min(1, Number(research.score || 0))), relationType: String(research.relationship_type || "unexpected"), researchJson: JSON.stringify(research), status: research.recommend ? "opportunity" : "filtered", createdAt: new Date() });
-      return Response.json({ matchId, research, usage: { ...usage, latencyMs: result.latencyMs } });
+      return Response.json({ matchId, research, usage: { input: 0, output: 0, micros: 0, latencyMs: 0 }, engine: "profile-matching-v1" });
+    }
+    if (action === "match_existing") {
+      const experimentId = String(body.experimentId), threshold = Math.max(0, Math.min(1, Number(body.threshold || .3))), savedProfiles = await db.select().from(profiles).where(eq(profiles.experimentId, experimentId));
+      const created: Array<{ matchId: string; personaAId: string; personaBId: string; variant: string; research: ReturnType<typeof deterministicResearch> }> = [];
+      for (const variant of ["A", "B"]) {
+        const pool = savedProfiles.filter(row => row.variant === variant && row.readiness >= threshold).map(row => ({ row, profile: parseJson(row.profileJson) as Record<string, any> }));
+        const candidates: Array<{ a: typeof pool[number]; b: typeof pool[number]; retrieval: number }> = [];
+        for (let i = 0; i < pool.length; i++) for (let j = i + 1; j < pool.length; j++) { const research = deterministicResearch(pool[i].profile, pool[j].profile); candidates.push({ a: pool[i], b: pool[j], retrieval: research.score }); }
+        candidates.sort((a, b) => b.retrieval - a.retrieval); const used = new Set<string>();
+        for (const pair of candidates) {
+          if (used.has(pair.a.row.personaId) || used.has(pair.b.row.personaId)) continue;
+          const existing = await db.select().from(matches).where(and(eq(matches.experimentId, experimentId), eq(matches.personaAId, pair.a.row.personaId), eq(matches.personaBId, pair.b.row.personaId), eq(matches.variant, variant))).limit(1);
+          if (existing.length) { used.add(pair.a.row.personaId); used.add(pair.b.row.personaId); continue; }
+          const research = deterministicResearch(pair.a.profile, pair.b.profile), matchId = id("match");
+          await db.insert(matches).values({ id: matchId, experimentId, personaAId: pair.a.row.personaId, personaBId: pair.b.row.personaId, variant, score: research.score, relationType: research.relationship_type, researchJson: JSON.stringify(research), status: "opportunity", createdAt: new Date() });
+          created.push({ matchId, personaAId: pair.a.row.personaId, personaBId: pair.b.row.personaId, variant, research }); used.add(pair.a.row.personaId); used.add(pair.b.row.personaId);
+        }
+      }
+      return Response.json({ created, threshold, engine: "profile-matching-v1" }, { status: 201 });
     }
     if (action === "create_group") {
       const matchId = String(body.matchId), variant = body.variant === "B" ? "B" : "A", groupKey = `group:${matchId}`;

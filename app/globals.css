@@ -1,4 +1,5 @@
 @import "tailwindcss";
+.match-repair{display:flex;align-items:center;justify-content:space-between;gap:18px;margin:0 20px 18px;padding:15px 17px;border:1px solid #6a5630;background:#241d12;border-radius:13px}.match-repair span b,.match-repair span small{display:block}.match-repair span b{font:13px Georgia;color:#dbc18d}.match-repair span small{margin-top:5px;color:#887a61;font-size:9px;line-height:1.55}.match-repair button{flex:none;border:1px solid #80683b;background:#352a18;color:#dfc48d;border-radius:9px;padding:9px 12px;font-size:10px}
 .group-created{display:block!important}
 .group-chat{margin-top:14px;border-top:1px solid #2e4734;padding-top:12px}
 .group-chat summary{cursor:pointer;color:#91b99a;font-size:10px}
