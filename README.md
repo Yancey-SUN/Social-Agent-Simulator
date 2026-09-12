@@ -1,4 +1,4 @@
-# Vouch Lab — Social Agent Simulator
+# Social Agent Simulator
 
 [中文](#中文) · [English](#english)
 
