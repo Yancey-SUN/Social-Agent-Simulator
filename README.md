@@ -10,7 +10,7 @@
 
 ### 项目简介
 
-Vouch Lab — Social Agent Simulator 是一个社交 Agent 全链路模拟器，用于在产品正式上线前验证以下核心假设：
+Social Agent Simulator 是一个社交 Agent 全链路模拟器，用于在产品正式上线前验证以下核心假设：
 
 > 用户与长期陪伴型 Agent 聊得越多，Agent 获得的真实 Context 越丰富，就越有机会在合适的时机识别用户的社交意图，并推荐一个真正值得认识的人。
 
